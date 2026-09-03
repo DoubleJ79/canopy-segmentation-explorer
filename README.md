@@ -1,7 +1,7 @@
 # Canopy Segmentation Explorer
 
-A Shiny app (built as a Quarto document) for segmenting crop canopy from a
-drone RGB orthomosaic and reporting vegetation cover per plot.
+A Shiny app for segmenting crop canopy from a drone RGB orthomosaic and
+reporting vegetation cover per plot.
 
 Upload a drone orthomosaic (GeoTIFF) and a plot-boundary file, pick a
 vegetation index, drag a threshold slider while watching a live segmentation
@@ -21,11 +21,10 @@ soil-masked RGB image, and percent vegetation cover per plot as a CSV.
 
 ## Running locally
 
-Requires R with the `shiny` and `terra` packages, and
-[Quarto](https://quarto.org). Either:
+Requires R with the `shiny` and `terra` packages. Either:
 
-- Open `canopy-segmentation-explorer.qmd` in RStudio and click **Run Document**, or
-- From a terminal: `quarto serve canopy-segmentation-explorer.qmd`
+- Open `app.R` in RStudio and click **Run App**, or
+- From a terminal: `Rscript -e "shiny::runApp()"`
 
 This project uses [renv](https://rstudio.github.io/renv/) to lock package
 versions; run `renv::restore()` after cloning to install the exact versions
