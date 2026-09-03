@@ -1,0 +1,465 @@
+---
+title: "Canopy Segmentation Explorer"
+author: "John Sulik"
+format: html
+server: shiny
+---
+
+Upload a drone RGB orthomosaic and a plot-boundary file, explore the
+vegetation index and threshold live, then process at full resolution to get
+a vegetation mask, a soil-masked RGB image, and percent cover per plot.
+
+**Typical workflow:**
+
+1. Upload your orthomosaic and plot boundaries (**1. Files**).
+2. Sparse or early-emergence canopy can be hard to discern over a whole
+   field so if that's an issue, turn on **Zoom preview to one plot**
+   (**2. Preview area**).
+3. If your orthomosaic includes a near-infrared band, turn that on and set
+   which bands are NIR and red (**3. Near-infrared**) to make NDVI an option.
+4. Pick an index (**4. Index**), click the (i) next to it if you're not
+   sure which one to use or why its scale looks the way it does, then drag
+   the threshold slider next to the histogram until the segmentation
+   overlay matches what you'd call vegetation by eye.
+5. Click **Process at full resolution** (**5. Full-resolution export**) to
+   compute the real vegetation mask, soil-masked RGB image, and per-plot
+   cover, and download them.
+
+```{r}
+#| context: setup
+
+invisible(capture.output(suppressPackageStartupMessages({
+  library(shiny)
+  library(terra)
+})))
+
+terraOptions(progress = 0, memfrac = 0.3, todisk = TRUE)
+options(shiny.maxRequestSize = 3000 * 1024^2)  # drone orthomosaics run large; default Shiny limit is 5MB
+
+PREVIEW_MAX_DIM <- 500  # longest side, in px, of the downsampled preview everything below the file inputs reacts to
+
+norm_fun <- function(r, g, b) {
+  # Normalized ExGR, following Woebbecke et al. (1995): normalize each band to
+  # its share of total brightness first (r+g+b=1), then combine as 3g-2.4r-b.
+  # Guarded against dividing by zero for a pure-black pixel.
+  denom <- r + g + b
+  rn <- ifelse(denom > 0, r / denom, NA)
+  gn <- ifelse(denom > 0, g / denom, NA)
+  bn <- ifelse(denom > 0, b / denom, NA)
+  3 * gn - 2.4 * rn - bn
+}
+raw_fun <- function(r, g, b) {
+  # Raw ExGR = ExG - ExR = (2G - R - B) - (1.4R - G) = 3G - 2.4R - B, unnormalized.
+  3 * g - 2.4 * r - b
+}
+grvi_fun <- function(r, g, b) {
+  # Green-Red Vegetation Index: (G - R) / (G + R) -- same normalized-difference
+  # form as NDVI, but built entirely from visible bands.
+  denom <- g + r
+  ifelse(denom != 0, (g - r) / denom, NA)
+}
+exg_fun <- function(r, g, b) {
+  # Excess Green: 2G - R - B, unnormalized (same large scale as raw ExGR).
+  2 * g - r - b
+}
+ndvi_fun <- function(nir, red) {
+  denom <- nir + red
+  ifelse(denom != 0, (nir - red) / denom, NA)
+}
+
+# One entry per index that only needs the orthomosaic's own R/G/B bands.
+# NDVI is kept separate below since it needs a different pair of bands (NIR
+# + red, picked by the user) and is only ever available once nir_band is
+# set -- everything that varies per index (its formula, default threshold,
+# and the explanation behind its info icon) lives here once, rather than
+# repeated across the preview, threshold-default, and full-resolution-export
+# logic further down.
+rgb_indices <- list(
+  "Normalized ExGR" = list(
+    fun = norm_fun, default = -0.01,
+    info = "r = R/(R+G+B), g = G/(R+G+B), b = B/(R+G+B); ExG - ExR = (2g - r - b) - (1.4r - g) = 3g - 2.4r - b"
+  ),
+  "Raw ExGR" = list(
+    fun = raw_fun, default = 0,
+    info = "ExG - ExR = (2G - R - B) - (1.4R - G) = 3G - 2.4R - B"
+  ),
+  "GRVI" = list(
+    fun = grvi_fun, default = 0,
+    info = "(G - R) / (G + R)"
+  ),
+  "ExG" = list(
+    fun = exg_fun, default = 0,
+    info = "2G - R - B"
+  )
+)
+ndvi_info <- "(NIR - Red) / (NIR + Red)"
+
+default_threshold_for <- function(index_method) {
+  if (identical(index_method, "NDVI")) return(0.2)
+  spec <- rgb_indices[[index_method]]
+  if (!is.null(spec)) spec$default else 0
+}
+
+# input id for each index's (i) info button.
+index_info_id <- c("Normalized ExGR" = "info_norm_exgr", "Raw ExGR" = "info_raw_exgr",
+                    "GRVI" = "info_grvi", "ExG" = "info_exg", "NDVI" = "info_ndvi")
+
+available_indices <- function(include_ndvi) c(names(rgb_indices), if (include_ndvi) "NDVI")
+
+# Hand-built rather than radioButtons(choiceNames=...): reproduces the same
+# markup radioButtons() itself generates (each option is a div.radio >
+# label > input[type=radio] + span, all inside a div.shiny-input-radiogroup
+# with id "index_method"), so Shiny's normal client-side binding still
+# picks it up as a working input, but puts each option's (i) button as a
+# SIBLING of the label instead of nested inside it. Nesting a button inside
+# the label would double as clicking the radio itself (labels toggle their
+# associated input on any click within them), and separately, an actionLink
+# placed there did not register clicks reliably at all when embedded in
+# radioButtons()'s own choiceNames and later swapped via
+# updateRadioButtons() -- confirmed directly, both a synthetic and a real
+# simulated click left its counter at 0.
+index_radio_ui <- function(nm, selected) {
+  tags$div(id = "index_method", class = "form-group shiny-input-radiogroup shiny-input-container",
+           role = "radiogroup", `aria-labelledby` = "index_method-label",
+    tags$label(class = "control-label", id = "index_method-label", `for` = "index_method", "Index"),
+    tags$div(class = "shiny-options-group",
+      lapply(nm, function(x) {
+        tags$div(class = "radio",
+          tags$label(
+            tags$input(type = "radio", name = "index_method", value = x,
+                       checked = if (identical(x, selected)) "checked" else NULL),
+            tags$span(x)
+          ),
+          actionButton(index_info_id[[x]], label = icon("circle-info"), class = "btn-link btn-xs",
+                       style = "padding: 0 0 0 6px; vertical-align: baseline; line-height: 1;")
+        )
+      })
+    )
+  )
+}
+
+# Blends vegetation-classified cells toward a highlight color directly in
+# the R/G/B bands rather than layering a semi-transparent mask on top --
+# terra's own plot(mask, col=c(NA,"green"), add=TRUE) does not composite
+# transparently over plotRGB() (an NA-mapped cell paints opaque white,
+# hiding the photo underneath), discovered by looking at a rendered test
+# image, not by reading the code. Red rather than green specifically:
+# green-on-green canopy makes it hard to spot misclassified pixels: red
+# reads clearly against both green vegetation and tan/pink soil.
+blend_overlay <- function(rgb_rast, idx_rast, threshold) {
+  is_veg <- idx_rast >= threshold
+  alpha <- 0.45
+  highlight <- c(230, 25, 25)
+  r2 <- ifel(is_veg, (1 - alpha) * rgb_rast[[1]] + alpha * highlight[1], rgb_rast[[1]])
+  g2 <- ifel(is_veg, (1 - alpha) * rgb_rast[[2]] + alpha * highlight[2], rgb_rast[[2]])
+  b2 <- ifel(is_veg, (1 - alpha) * rgb_rast[[3]] + alpha * highlight[3], rgb_rast[[3]])
+  out <- c(r2, g2, b2)
+  names(out) <- c("R", "G", "B")
+  out
+}
+
+# Shiny renames every uploaded file to a meaningless temp name (0.dat,
+# 1.dat, ...), which breaks multi-file formats like shapefiles whose parts
+# (.shp/.dbf/.shx/.prj) must sit next to each other under matching names.
+# Copies each upload into one temp folder under its ORIGINAL name instead,
+# and returns the path to whichever file terra should actually open.
+stage_upload <- function(file_input, pattern) {
+  dir <- tempfile("upload_")
+  dir.create(dir)
+  file.copy(file_input$datapath, file.path(dir, file_input$name))
+  main <- file_input$name[grepl(pattern, file_input$name, ignore.case = TRUE)]
+  req(length(main) >= 1)
+  file.path(dir, main[1])
+}
+```
+
+```{r}
+#| label: layout
+
+tagList(
+
+tags$style(HTML("
+  .busy-spinner { display: none; align-items: center; gap: 8px; margin: 4px 0 10px 0; color: #666; }
+  .shiny-busy .busy-spinner { display: flex; }
+  .busy-spinner .spin {
+    width: 16px; height: 16px; flex: none;
+    border: 2px solid #ccc; border-top-color: #666; border-radius: 50%;
+    animation: busy-spin 0.8s linear infinite;
+  }
+  @keyframes busy-spin { to { transform: rotate(360deg); } }
+")),
+
+sidebarLayout(
+
+  sidebarPanel(
+    width = 4,
+
+    h4("1. Files"),
+    fileInput("ortho_file", "Drone orthomosaic (GeoTIFF)", accept = c(".tif", ".tiff")),
+    fileInput("plots_file", "Plot boundaries", multiple = TRUE,
+              accept = c(".geojson", ".json", ".gpkg", ".shp", ".dbf", ".shx", ".prj")),
+    helpText("For a shapefile, select all of .shp/.dbf/.shx/.prj together."),
+
+    h4("2. Preview area"),
+    checkboxInput("zoom_plot", "Zoom preview to one plot", value = FALSE),
+    conditionalPanel(
+      "input.zoom_plot",
+      selectInput("zoom_plot_id", "Plot", choices = character(0))
+    ),
+    helpText("Averaging over the whole field can wash out sparse or early-emergence canopy. Zooming to about a third of one plot's area keeps real detail visible instead of blending it away. This only affects what you see below, never the full-resolution export."),
+
+    h4("3. Near-infrared (optional)"),
+    checkboxInput("use_ndvi", "My orthomosaic has a near-infrared band", value = FALSE),
+    conditionalPanel(
+      "input.use_ndvi",
+      numericInput("nir_band", "NIR band number", value = 4, min = 1, step = 1),
+      numericInput("red_band", "Red band number", value = 1, min = 1, step = 1)
+    ),
+
+    h4("4. Index"),
+    uiOutput("index_method_ui"),
+    helpText("Drag the threshold slider next to the histogram below."),
+    checkboxInput("show_overlay", "Show segmentation overlay", value = TRUE),
+
+    h4("5. Full-resolution export"),
+    actionButton("process", "Process at full resolution", class = "btn-primary"),
+    br(), br(),
+    uiOutput("download_ui")
+  ),
+
+  mainPanel(
+    width = 8,
+    h5("Segmentation overlay"),
+    div(class = "busy-spinner", div(class = "spin"), span("Computing, this can take a moment for a large orthomosaic...")),
+    plotOutput("overlay_plot", height = "350px"),
+    h5("RGB"),
+    plotOutput("rgb_plot", height = "350px"),
+    h5("Histogram and threshold"),
+    plotOutput("hist_plot", height = "250px"),
+    sliderInput("threshold", "Threshold", min = -1, max = 1, value = -0.01, step = 0.001, width = "100%"),
+    helpText("If the overlay is missing plant pixels you want included, push the slider left (lower threshold). If it's picking up too much soil, push it right (raise threshold)."),
+    strong(textOutput("veg_fraction_text")),
+    h4("Vegetation cover by plot"),
+    p("Only populated after Process at full resolution. This table (and the downloads above) use the exact, full-resolution mask, not the preview."),
+    tableOutput("plot_cover_table")
+  )
+)
+
+)
+```
+
+```{r}
+#| context: server
+
+# --- Load whatever was uploaded ------------------------------------------
+
+ortho_full <- reactive({
+  req(input$ortho_file)
+  rast(input$ortho_file$datapath)
+})
+
+rgb <- reactive({
+  s <- ortho_full()[[1:3]]
+  names(s) <- c("R", "G", "B")
+  s
+})
+
+plots_vec <- reactive({
+  req(input$plots_file)
+  path <- stage_upload(input$plots_file, "\\.(geojson|json|gpkg|shp)$")
+  v <- vect(path)
+  if (!same.crs(v, rgb())) v <- project(v, rgb())  # keep zonal stats meaningful if the plot file arrives in a different projection
+  v
+})
+
+# "Plot 3 (D)" when the plot file carries a first attribute worth showing (e.g. Treatment), else just "Plot 3".
+observeEvent(plots_vec(), {
+  pv <- plots_vec()
+  df <- as.data.frame(pv)
+  n <- nrow(pv)
+  labels <- if (ncol(df) >= 1) paste0("Plot ", seq_len(n), " (", df[[1]], ")") else paste0("Plot ", seq_len(n))
+  updateSelectInput(session, "zoom_plot_id", choices = setNames(seq_len(n), labels))
+})
+
+# --- Downsampled preview: fast, rebuilt whenever the files, NIR/red band, or preview area change ---
+
+# Either the full orthomosaic, or (when "Zoom preview to one plot" is on) a
+# window sized to a third of that plot's own area, centered on it -- so a
+# thin or sparse early-emergence canopy doesn't get averaged away over the
+# whole field. Only feeds the preview below; the full-resolution export
+# always uses the complete image regardless of this setting.
+preview_source <- reactive({
+  full <- ortho_full()
+  if (!isTRUE(input$zoom_plot)) return(full)
+  req(input$zoom_plot_id, plots_vec())
+  idx <- as.integer(input$zoom_plot_id)
+  pv <- plots_vec()
+  req(idx >= 1, idx <= nrow(pv))
+  one_plot <- pv[idx, ]
+  side <- sqrt(expanse(one_plot) / 3)
+  ctr <- crds(centroids(one_plot, inside = TRUE))[1, ]
+  crop(full, ext(ctr[1] - side / 2, ctr[1] + side / 2, ctr[2] - side / 2, ctr[2] + side / 2))
+})
+
+preview <- reactive({
+  full_p <- preview_source()
+  s <- full_p[[1:3]]
+  names(s) <- c("R", "G", "B")
+  fact <- max(1L, ceiling(max(nrow(s), ncol(s)) / PREVIEW_MAX_DIM))
+  preview_rgb <- aggregate(s, fact = fact, fun = "mean", na.rm = TRUE)
+
+  ndvi_prev <- if (isTRUE(input$use_ndvi)) {
+    req(input$nir_band, input$red_band)
+    nir_p <- aggregate(full_p[[input$nir_band]], fact = fact, fun = "mean", na.rm = TRUE)
+    red_p <- aggregate(full_p[[input$red_band]], fact = fact, fun = "mean", na.rm = TRUE)
+    lapp(c(nir_p, red_p), ndvi_fun)
+  } else {
+    NULL
+  }
+
+  result <- lapply(rgb_indices, function(spec) lapp(preview_rgb, spec$fun))
+  result$rgb <- preview_rgb
+  result$NDVI <- ndvi_prev
+  result
+})
+
+# Index choices grow an NDVI option only once it's actually available; the
+# whole radio group is rebuilt (see index_radio_ui() in Setup) so each
+# option keeps its own (i) button next to it.
+output$index_method_ui <- renderUI({
+  nm <- available_indices(isTRUE(input$use_ndvi))
+  selected <- if (isTruthy(input$index_method) && input$index_method %in% nm) input$index_method else nm[1]
+  index_radio_ui(nm, selected)
+})
+
+observeEvent(input$info_norm_exgr, showModal(modalDialog(title = "Normalized ExGR", rgb_indices[["Normalized ExGR"]]$info, easyClose = TRUE)))
+observeEvent(input$info_raw_exgr, showModal(modalDialog(title = "Raw ExGR", rgb_indices[["Raw ExGR"]]$info, easyClose = TRUE)))
+observeEvent(input$info_grvi, showModal(modalDialog(title = "GRVI", rgb_indices[["GRVI"]]$info, easyClose = TRUE)))
+observeEvent(input$info_exg, showModal(modalDialog(title = "ExG", rgb_indices[["ExG"]]$info, easyClose = TRUE)))
+observeEvent(input$info_ndvi, showModal(modalDialog(title = "NDVI", ndvi_info, easyClose = TRUE)))
+
+active_index <- reactive({
+  req(input$index_method)
+  preview()[[input$index_method]]
+})
+
+# Threshold slider tracks whichever index is active: its own real data range, and a sensible default.
+observeEvent(active_index(), {
+  idx <- active_index()
+  req(idx)
+  r <- range(values(idx)[, 1], na.rm = TRUE)
+  if (!all(is.finite(r))) return()
+  updateSliderInput(session, "threshold",
+                     min = r[1], max = r[2],
+                     value = default_threshold_for(input$index_method),
+                     step = (r[2] - r[1]) / 500)
+})
+
+# --- Preview plots and stats: instant, pure R-side reactivity, no re-render step ---
+
+output$rgb_plot <- renderPlot({
+  req(preview())
+  plotRGB(preview()$rgb, r = 1, g = 2, b = 3, stretch = "lin", mar = c(0, 0, 0, 0))
+})
+
+output$overlay_plot <- renderPlot({
+  idx <- active_index()
+  req(idx)
+  if (isTRUE(input$show_overlay)) {
+    plotRGB(blend_overlay(preview()$rgb, idx, input$threshold), r = 1, g = 2, b = 3, stretch = "lin", mar = c(0, 0, 0, 0))
+  } else {
+    plotRGB(preview()$rgb, r = 1, g = 2, b = 3, stretch = "lin", mar = c(0, 0, 0, 0))
+  }
+})
+
+output$hist_plot <- renderPlot({
+  idx <- active_index()
+  req(idx)
+  v <- values(idx)[, 1]
+  h <- hist(v, breaks = 60, plot = FALSE)
+  # Bars at or above the threshold are what the overlay currently counts as vegetation.
+  bar_col <- ifelse(h$mids >= input$threshold, "forestgreen", "grey80")
+  plot(h, col = bar_col, border = "white", main = NULL, xlab = input$index_method, ylab = "Count")
+  abline(v = input$threshold, col = "red", lwd = 2)
+})
+
+output$veg_fraction_text <- renderText({
+  idx <- active_index()
+  req(idx)
+  v <- values(idx)[, 1]
+  frac <- 100 * mean(v >= input$threshold, na.rm = TRUE)
+  suffix <- if (isTRUE(input$show_overlay)) "" else "  (overlay hidden)"
+  sprintf("Vegetation fraction (preview): %.2f%%%s", frac, suffix)
+})
+
+# --- Full-resolution export: explicit, slow, only runs when asked ---
+
+full_res <- eventReactive(input$process, {
+  req(input$plots_file)
+  withProgress(message = "Processing at full resolution", value = 0, {
+
+    incProgress(0.1, detail = "computing index")
+    index_full <- if (input$index_method == "NDVI") {
+      req(input$nir_band, input$red_band)
+      lapp(c(ortho_full()[[input$nir_band]], ortho_full()[[input$red_band]]), ndvi_fun)
+    } else {
+      lapp(rgb(), rgb_indices[[input$index_method]]$fun)
+    }
+
+    incProgress(0.4, detail = "thresholding vegetation mask")
+    mask_path <- tempfile(fileext = ".tif")
+    vf_mask <- ifel(index_full >= input$threshold, 1, 0,
+                     filename = mask_path, overwrite = TRUE, wopt = list(datatype = "INT1U"))
+    names(vf_mask) <- "veg_fraction"
+
+    incProgress(0.2, detail = "soil-masked RGB")
+    soiless_path <- tempfile(fileext = ".tif")
+    mask(rgb(), vf_mask, maskvalues = 0,
+         filename = soiless_path, overwrite = TRUE, wopt = list(datatype = "INT1U"))
+
+    incProgress(0.2, detail = "vegetation cover by plot")
+    plots_v <- plots_vec()
+    # rasterize()+zonal() rather than terra::extract(plots, ...): for long,
+    # thin plots (strip trials running nearly the full length of a field),
+    # extract()'s per-polygon clipping can exhaust memory on a large
+    # raster -- confirmed directly on a real 6-strip field. Rasterizing the
+    # plot IDs onto the mask's own grid once, then computing zonal means,
+    # gets identical numbers without ever clipping a polygon out of the
+    # raster.
+    zone_id <- rasterize(plots_v, vf_mask, field = seq_len(nrow(plots_v)))
+    names(zone_id) <- "zone"
+    veg_zonal <- zonal(vf_mask, zone_id, fun = "mean", na.rm = TRUE)
+    zone_match <- match(seq_len(nrow(plots_v)), veg_zonal$zone)
+    plots_v$PctCover <- round(100 * veg_zonal$veg_fraction[zone_match], 1)
+
+    incProgress(0.1)
+    list(mask_path = mask_path, soiless_path = soiless_path, plots_df = as.data.frame(plots_v))
+  })
+})
+
+output$plot_cover_table <- renderTable({
+  full_res()$plots_df
+})
+
+output$download_ui <- renderUI({
+  req(full_res())
+  tagList(
+    downloadButton("dl_mask", "Vegetation mask (.tif)"),
+    downloadButton("dl_soiless", "Soil-masked RGB (.tif)"),
+    downloadButton("dl_table", "Plot cover (.csv)")
+  )
+})
+
+output$dl_mask <- downloadHandler(
+  filename = function() "vegetation_mask.tif",
+  content = function(file) file.copy(full_res()$mask_path, file)
+)
+output$dl_soiless <- downloadHandler(
+  filename = function() "soil_masked_rgb.tif",
+  content = function(file) file.copy(full_res()$soiless_path, file)
+)
+output$dl_table <- downloadHandler(
+  filename = function() "vegetation_cover_by_plot.csv",
+  content = function(file) write.csv(full_res()$plots_df, file, row.names = FALSE)
+)
+```
